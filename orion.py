@@ -1,3 +1,9 @@
+'''
+This program fetches OHLC data from BTC(applicable to other cryptocurrencies, futures,
+and mostly any liquid equity). It then analyzes for liquidity sweeps and conducts a 
+multi-timeframe analysis to determine the likelihood of a reversal on the high 
+time fram chart
+'''
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -39,6 +45,99 @@ def fetch_ohlc_data(coin_id, vs_currency, days):
 # --- SMC Pattern Detection Module ---
 # This section contains all logic specific to SMC concepts.
 
+def find_swing_highs(df, window=5, price_tolerance_percent=0.005, is_high=True):
+    """
+    Identifies significant swing highs (peaks) or swing lows (troughs) in the price data.
+    A point is a swing if it's the highest/lowest in 'window' bars before and after.
+    Returns a list of dictionaries: [{'timestamp': ..., 'value': ...}]
+    """
+    swing_points = []
+    series = df['high'] if is_high else df['low']
+    if series.empty:
+        return []
+
+    for i in range(window, len(df) - window):
+        current_val = series.iloc[i]
+        is_swing = False
+        if is_high and current_val == series.iloc[i - window: i + window + 1].max():
+            is_swing = True
+        elif not is_high and current_val == series.iloc[i - window: i + window + 1].min():
+            is_swing = True
+
+        if is_swing:
+            swing_points.append({'timestamp': df.index[i], 'value': current_val})
+
+    if not swing_points: return []
+
+    # Consolidate nearby levels
+    swing_points.sort(key=lambda x: x['value'], reverse=is_high)
+    consolidated_points = []
+    for sp in swing_points:
+        is_unique = True
+        for existing_sp in consolidated_points:
+            if abs(sp['value'] - existing_sp['value']) / existing_sp['value'] < price_tolerance_percent:
+                is_unique = False
+                break
+        if is_unique:
+            consolidated_points.append(sp)
+
+    consolidated_points.sort(key=lambda x: x['timestamp'])
+    return consolidated_points
+
+
+def detect_bearish_liquidity_sweeps(df, price_swing_highs_raw, wick_ratio_threshold=0.6, close_below_peak_factor=0.99):
+    """
+    Detects conceptual bearish liquidity sweeps.
+    Looks for a candle whose high sweeps above a previous swing high,
+    but then closes significantly lower, indicating rejection.
+
+    Args:
+        df (pd.DataFrame): OHLC DataFrame with 'open', 'high', 'low', 'close' columns.
+        price_swing_highs_raw (list): List of identified swing high dictionaries.
+        wick_ratio_threshold (float): Minimum ratio of upper wick length to total candle range.
+        close_below_peak_factor (float): Factor to determine if close is "significantly below" the swept peak.
+
+    Returns:
+        list of dict: Detected bearish liquidity sweep events.
+    """
+    sweeps = []
+    if not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+        return []
+
+    swing_high_prices = [sh['value'] for sh in price_swing_highs_raw]
+
+    for i in range(1, len(df)):
+        current_candle = df.iloc[i]
+        prev_candle = df.iloc[i - 1]
+
+        swept_level = None
+        for sh_price in swing_high_prices:
+            if current_candle['high'] > sh_price and prev_candle['high'] <= sh_price:
+                swept_level = sh_price
+                break
+
+        if swept_level is not None:
+            total_range = current_candle['high'] - current_candle['low']
+            if total_range == 0: continue
+
+            upper_wick = current_candle['high'] - max(current_candle['open'], current_candle['close'])
+
+            is_long_upper_wick = (upper_wick / total_range) > wick_ratio_threshold
+            is_bearish_close = current_candle['close'] < current_candle['open']
+            is_strong_rejection = current_candle['close'] < (swept_level * close_below_peak_factor)
+
+            if is_long_upper_wick and is_bearish_close and is_strong_rejection:
+                sweeps.append({
+                    'timestamp': current_candle.name,
+                    'type': 'Bearish Liquidity Sweep',
+                    'swept_level': swept_level,
+                    'sweep_high': current_candle['high'],
+                    'close_price': current_candle['close'],
+                    'reason': f"Candle wicked above previous swing high ({swept_level:.2f}) with long upper wick and closed significantly lower."
+                })
+    return sweeps
+
+
 def detect_fair_value_gaps(df):
     """
     Identifies Fair Value Gaps (FVG) based on a three-candle pattern.
@@ -59,8 +158,8 @@ def detect_fair_value_gaps(df):
             fvg_bullish.append({
                 'timestamp_start': candle1.name,
                 'timestamp_end': candle3.name,
-                'low_price': candle3['low'],
-                'high_price': candle1['high'],
+                'low_price': candle1['high'],
+                'high_price': candle3['low'],
                 'type': 'bullish'
             })
 
@@ -69,21 +168,19 @@ def detect_fair_value_gaps(df):
             fvg_bearish.append({
                 'timestamp_start': candle1.name,
                 'timestamp_end': candle3.name,
-                'low_price': candle1['low'],
-                'high_price': candle3['high'],
+                'low_price': candle3['high'],
+                'high_price': candle1['low'],
                 'type': 'bearish'
             })
 
     return fvg_bullish, fvg_bearish
 
 
-def detect_order_blocks(df, volume_filter_factor=0.8, impulse_factor=1.5):
+def detect_order_blocks(df, impulse_factor=1.5):
     """
     Identifies a simplified Order Block.
     It looks for the last down-candle before a strong bullish move or the last up-candle
-    before a strong bearish move, using price and volume for confirmation.
-    NOTE: Volume is not available in CoinGecko's /ohlc, so this function is conceptual.
-    It will check for an 'impulse' move without a volume check for now.
+    before a strong bearish move.
     """
     ob_bullish = []
     ob_bearish = []
@@ -140,7 +237,8 @@ def plot_analysis_results(df_htf, df_ltf, htf_draws, ltf_reversals, ltf_continua
             color = 'red' if 'high' in point else 'green'
             ax1.axhline(y=point['value'], color=color, linestyle='--', linewidth=1, alpha=0.7, label='_nolegend_')
 
-        ax1.axhline(y=htf_draws[0]['value'], color=color, linestyle='--', linewidth=1, alpha=0.7,
+        # This part is for the legend, ensuring it only appears once
+        ax1.axhline(y=htf_draws[0]['value'], color='gray', linestyle='--', linewidth=1, alpha=0.7,
                     label='HTF Draws on Liquidity')
 
     ax1.set_title('High Timeframe Analysis (4-hour)', fontsize=18)
@@ -153,20 +251,26 @@ def plot_analysis_results(df_htf, df_ltf, htf_draws, ltf_reversals, ltf_continua
 
     # Mark LTF Reversals (Liquidity Sweeps)
     if ltf_reversals:
+        # Use a dummy plot for the legend label
+        ax2.scatter([], [], color='red', marker='X', s=100, label='Bearish Sweep')
         for sweep in ltf_reversals:
-            ax2.scatter(sweep['timestamp'], sweep['sweep_high'], color='red', marker='X', s=100, zorder=5,
-                        label='Bearish Sweep' if sweep == ltf_reversals[0] else "_nolegend_")
+            ax2.scatter(sweep['timestamp'], sweep['sweep_high'], color='red', marker='X', s=100, zorder=5)
 
     # Mark FVG (Continuation Confluence)
-    bullish_fvgs = [f for f in ltf_continuations['FVG'] if f['type'] == 'bullish']
-    bearish_fvgs = [f for f in ltf_continuations['FVG'] if f['type'] == 'bearish']
+    bullish_fvgs = [f for f in ltf_continuations['FVG'][0]]
+    bearish_fvgs = [f for f in ltf_continuations['FVG'][1]]
 
-    for fvg in bullish_fvgs:
-        ax2.axhspan(fvg['low_price'], fvg['high_price'], facecolor='green', alpha=0.2,
-                    label='Bullish FVG' if fvg == bullish_fvgs[0] else "_nolegend_")
-    for fvg in bearish_fvgs:
-        ax2.axhspan(fvg['low_price'], fvg['high_price'], facecolor='red', alpha=0.2,
-                    label='Bearish FVG' if fvg == bearish_fvgs[0] else "_nolegend_")
+    # Use dummy plots for legend labels for FVG
+    if bullish_fvgs:
+        ax2.axhspan(bullish_fvgs[0]['low_price'], bullish_fvgs[0]['high_price'], facecolor='green', alpha=0.2,
+                    label='Bullish FVG')
+        for fvg in bullish_fvgs[1:]:
+            ax2.axhspan(fvg['low_price'], fvg['high_price'], facecolor='green', alpha=0.2)
+    if bearish_fvgs:
+        ax2.axhspan(bearish_fvgs[0]['low_price'], bearish_fvgs[0]['high_price'], facecolor='red', alpha=0.2,
+                    label='Bearish FVG')
+        for fvg in bearish_fvgs[1:]:
+            ax2.axhspan(fvg['low_price'], bearish_fvgs[0]['high_price'], facecolor='red', alpha=0.2)
 
     ax2.set_title('Low Timeframe Analysis (30-minute)', fontsize=18)
     ax2.set_xlabel('Date', fontsize=14)
@@ -191,44 +295,45 @@ def run_multi_timeframe_analysis(coin_id, vs_currency):
     # 1. Fetch High Timeframe (HTF) Data
     print(f"--- Fetching HTF ({htf_days} days) data for {coin_id.capitalize()} ---")
     df_htf = fetch_ohlc_data(coin_id, vs_currency, htf_days)
-    if df_htf is None or df_htf.empty: return
+    if df_htf is None or df_htf.empty:
+        print("Failed to fetch HTF data. Exiting.")
+        return
 
     # 2. Fetch Low Timeframe (LTF) Data
     print(f"--- Fetching LTF ({ltf_days} day) data for {coin_id.capitalize()} ---")
     df_ltf = fetch_ohlc_data(coin_id, vs_currency, ltf_days)
-    if df_ltf is None or df_ltf.empty: return
+    if df_ltf is None or df_ltf.empty:
+        print("Failed to fetch LTF data. Exiting.")
+        return
 
     # 3. HTF Analysis: Identify Draws on Liquidity
-    # We will use the swing highs/lows as a proxy for this.
     print("\n--- HTF Analysis: Identifying Draws on Liquidity ---")
-    htf_swing_highs = find_swing_highs(df_htf, window=5)
+    htf_swing_highs = find_swing_highs(df_htf, window=5, is_high=True)
     htf_swing_lows = find_swing_highs(df_htf, window=5, is_high=False)
     htf_draws_on_liquidity = htf_swing_highs + htf_swing_lows
 
     # 4. LTF Analysis: Detect Reversals & Continuation Confluence
     print("\n--- LTF Analysis: Detecting Patterns ---")
-    ltf_reversals = {
-        'liquidity_sweeps': detect_bearish_liquidity_sweeps(df_ltf, htf_swing_highs, wick_ratio_threshold=0.6,
-                                                            close_below_peak_factor=0.99)
-    }
+    # Need HTF swing highs for the LTF sweep detection logic
+    ltf_reversals_sweeps = detect_bearish_liquidity_sweeps(df_ltf, htf_swing_highs, wick_ratio_threshold=0.6,
+                                                           close_below_peak_factor=0.99)
 
     # Detect continuation confluence
     ltf_continuation_confluence = {
         'FVG': detect_fair_value_gaps(df_ltf),
         'OrderBlocks': detect_order_blocks(df_ltf),
-        # You would add 'BreakerBlocks' and other concepts here
     }
 
     # 5. Summarize and Plot
     print("\n--- Summary of Detected Patterns ---")
     print(f"HTF Draws on Liquidity: {len(htf_draws_on_liquidity)} levels identified.")
-    print(f"LTF Bearish Liquidity Sweeps: {len(ltf_reversals['liquidity_sweeps'])} events.")
+    print(f"LTF Bearish Liquidity Sweeps: {len(ltf_reversals_sweeps)} events.")
     print(
         f"LTF Fair Value Gaps: Bullish={len(ltf_continuation_confluence['FVG'][0])}, Bearish={len(ltf_continuation_confluence['FVG'][1])}")
 
     print("\nGenerating final chart...")
     plot_analysis_results(
-        df_htf, df_ltf, htf_draws_on_liquidity, ltf_reversals['liquidity_sweeps'],
+        df_htf, df_ltf, htf_draws_on_liquidity, ltf_reversals_sweeps,
         ltf_continuation_confluence
     )
 
